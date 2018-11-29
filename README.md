@@ -1,5 +1,4 @@
 # mystudy
-<<<<<<< HEAD
 do some study about codes
 =======
 busy doing my hobby
