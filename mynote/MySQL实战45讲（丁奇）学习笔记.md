@@ -647,6 +647,8 @@ alter table tuser add index index2(email(6)); # 指定前缀索引长度，将�
 
 - 干净页：内存数据页跟磁盘数据页一致。
 
+- 脏页与干净页的判断：每个数据页头部都有8字节的LSN，每次修改都会变大，LSN比checkpoint的LSN小的一定是干净页，反之则为脏页。
+
 - 慢之因：刷脏页（flush）。
 
 - 触发flush的四种场景：
@@ -658,7 +660,7 @@ alter table tuser add index index2(email(6)); # 指定前缀索引长度，将�
   - 系统”空闲“的时候，无性能问题。
   - MySQL正常关闭的时候，无性能问题。
 
-- 每个数据页有且仅有两种状态：
+- 每个数据页有且仅有两种状态（最有效率）：
 
   - 在内存里，一定是正确的结果，直接返回；
   - 内存中没有数据，数据文件上一定是正确的结果，读入内存后返回。
@@ -689,18 +691,65 @@ alter table tuser add index index2(email(6)); # 指定前缀索引长度，将�
     ```mysql
     set innodb_max_dirty_pages_pct=75; # 脏页比例上限，默认为75%，下图简写为maxD
     # 脏页比例 = Innodb_buffer_pool_pages_dirty/Innodb_buffer_pool_pages_total
-    
+    select VARIABLE_VALUE into @a from global_status where VARIABLE_VALUE = 'Innodb_buffer_pool_pages_dirty';
+    select VARIABLE_VALUE into @b from global_status where VARIABLE_VALUE = 'Innodb_buffer_pool_pages_total';
+  select @a/@b; #即下图中的“M”
     ```
-
+  
   ```mermaid
   graph TD
-  	A((start)) --> B(脏页比例M, max)
+  	A((start)) --> B(脏页比例M, maxD)
   	A --> C(N=当前redo日志序号-checkpoint序号)
-  	B --> D("F1=M < maxD ? 100 : 100*M/maxD")
-  	C --> E(F2)
+  	B --> D("F1(M)=M < maxD ? 100 : 100*M/maxD")
+  	C --> E("F2(N)")
   	D --> F("R=max{F1,F2}")
   	E --> F
   	F --> G("按照'IO能力✖R%'的速度刷脏页")
   	G --> H((end))
   	H -.-> A
   ```
+
+- 一个有趣的问题
+
+  ```mysql
+  # 连坐机制：机械硬盘时代比较有意义，对于SSD来说IOPS不是瓶颈
+  set innodb_flush_neighbors = 1; # 脏页旁边的数据页也是脏页时，会把“邻居”一起刷掉，减少随机IO
+  set innodb_flush_neighbors = 0; # 不找邻居，自己刷自己的
+  ```
+
+# 11 为何删除了大量数据之后表文件大小仍旧不变？
+
+## 11.1 原因
+
+```mysql
+set innodb_file_per_table = ON;  # （推荐）每个InnoDB表数据存储在以.ibd为后缀的文件中，即与表结构单独存放
+                                 # （推荐理由）容易管理；通过drop table命令可以直接删除文件，空间立即回收
+set innodb_file_per_table = OFF; # 表的数据放在系统共享表空间，也就是与数据字典放在一起
+                                 # （不推荐理由）表删除了，空间没有回收
+```
+
+- 现象：删除某些行，表空间没有被回收。
+- 数据删除真相
+  - delete命令只是把记录的位置，或者数据页标记为“可复用”，但磁盘文件的大小并没有变，而没有被“复用”的空间看起来像“空洞”。
+  - 数据随机插入可能造成的索引数据页分裂也会造成“空洞”。
+  - 把“空洞”去掉，就可以达到收缩表空间的目的。
+
+## 11.2 正确删除办法
+
+- 重建表（重建表A）
+
+  - 新建一个与表A结构相同的临时表B；
+
+  - 按照主键递增的顺序，从表A中按行读出数据插入到表B中；
+
+  - 最后将表B替换表A，删除旧表，达到重建表A的目的。
+
+    ```mysql
+    alter table A engine=InnoDB; # 自动完成重建表A
+    ```
+
+- Online重建表（5.6开始引入）
+
+  - 优势：重建表的同时允许对表做增删改操作。
+  - ；
+  - ；
