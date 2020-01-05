@@ -110,6 +110,10 @@ class F green
 
 - 两阶段提交的目的：使redo log和binlog之间的逻辑一致。
 - 两阶段提交是跨系统维持数据逻辑一致性的常用方案。
+- 上图中的"commit"与事务结束语句“commit”的区别：
+  - “commit语句”：MySQL语法中，用于提交一个事务的命令。
+  - “commit步骤”：事务提交过程中的最后一个步骤，执行完该步骤后，本事务提交完成。
+  - “commit语句”执行的时候，会包含“commit步骤”。
 
 # 3 事务的隔离性和隔离级别
 
@@ -736,6 +740,12 @@ set innodb_file_per_table = OFF; # 表的数据放在系统共享表空间，也
 
 ## 11.2 正确删除办法
 
+```mysql
+alter table A engine=InnoDB; # 自动完成重建表A
+# 等价于
+alter table A engine=InnoDB, ALGORITHM=inplace;
+```
+
 - 重建表（重建表A）
 
   - 新建一个与表A结构相同的临时表B；
@@ -745,11 +755,251 @@ set innodb_file_per_table = OFF; # 表的数据放在系统共享表空间，也
   - 最后将表B替换表A，删除旧表，达到重建表A的目的。
 
     ```mysql
-    alter table A engine=InnoDB; # 自动完成重建表A
+    alter table A engine=InnoDB, ALGORITHM=COPY; # 强制拷贝表，在server层重建表A
     ```
 
-- Online重建表（5.6开始引入）
+- Online DDL（5.6开始引入）
 
   - 优势：重建表的同时允许对表做增删改操作。
-  - ；
-  - ；
+  - 新建一个临时文件，扫描表A主键的所有数据页；
+  - 用数据页中表A的记录生成B+树，存储到临时文件中；
+  - 在上述操作过程中，将所有对表A的操作记录在row log中；
+  - 将row log应用到临时文件，得到逻辑数据上与表A相同的数据文件；
+  - 用临时文件替换表A的数据文件。
+  
+- Online DDL之由来
+
+  - alter语句启动之时，拿到了MDL写锁；
+  - MDL写锁在真正拷贝数据之前就退化成读锁。
+  - 退化成读锁的目的：
+    - 不对增删改操作造成阻塞；
+    - 禁止其他线程对目标表同时做DDL。
+  - 总结：Online DDL之所以可以称为”Online“是因为最耗时的操作是拷贝数据到临时文件，该操作不会阻塞增删改操作，而锁的时间非常短。
+
+- 注意：重建表都会扫描原表数据和构建临时文件，对于很大的表来说会很占IO和CPU资源，要小心控制时间。推荐使用ghost来做。
+
+- Online和inplace
+
+  - Online：整个DDL过程都是在InnoDB内部完成的，且DDL不会阻塞增删改操作；
+  - inplace：整个DDL过程都是在InnoDB内部完成的，对于server层来说，没有把数据挪到临时表，是一个”原地“操作。
+  - 两者关系
+    - DDL过程若是Online的，则一定也是inplace的；反之，未必。
+    - inplace的DDL过程不是Online的，举例：添加全文索引和空间索引。
+
+- 三种重建表的方式
+
+  ```mysql
+  alter table t engine=InnoDB; # 5.6开始默认为Online DDL, 亦即recreate
+  analyze table t;             # 不是重建表，只是重新统计表的索引信息，没有修改数据，加MDL读锁
+  optimize table t;            # 等价于recreate+analyze
+  ```
+
+- 重建表机制：重建表时，InnoDB不会把整张数据页占满，而是每个页预留了1/16给后续的更新用。
+
+# 12 如何高效率的统计表行数？
+
+## 12.1 count(*)的实现方式（不加where条件）
+
+- 不同引擎的实现方式
+  - MyISAM把表的总行数存在了磁盘上，执行`count(*)`时直接返回，效率很高，但其不支持事务是短板；
+  - InnoDB执行`count(*)`时，按行读取数据并累计行数，结果准确，但会导致性能问题 。 
+
+- MySQL的优化
+  - 优化器找最小的索引树来遍历。
+  - 通用法则：在保证逻辑正确的前提下，尽量减少扫描的数据量。
+- `show table status`表征行数的字段`TABLE_ROWS`是通过采样估算而来，误差在40%~50%，不能直接当作行数使用。
+
+## 12.2 业务上统计表行数可以采用的方法
+
+- 基本思想：找个地方，把操作记录表的行数存起来。
+- 用缓存系统保存计数（如Redis）
+  - 可能丢失计数更新；
+  - 逻辑上不精确（没有事务的一致性），场景：显示操作记录的总数，同时显示最近操作的100条记录。
+    - 查到的100行结果里有最新插入记录，而Redis的计数还没加1；
+    - 或者，查到的100行结果里没有最新插入记录，而Redis的计数已经加了1。
+- 在数据库中保存计数
+  - 解决了崩溃丢失的问题（crash safe）；
+  - rc隔离级别下，可重复读使得计数能够在逻辑上保持一致。
+
+## 12.3 不同的count性能比较
+
+- count()是一个聚合函数：对于满足条件的结果集，逐行判断count函数的参数是否为`null`，若不是则累计值就加1，否则不加，最后返回累计值。
+
+- 分析性能差异的三个原则：
+
+  - server层要什么就给什么；
+  - InnoDB只给必要的值；
+  - 优化器只优化了count(*)的语义为“取行数”，一些“显而易见”的优化并没有做。
+
+- count(主键id)：InnoDB遍历整张表，取出每一行的id值，返回给server层，server层判断id不为空，按行累加。
+
+- count(1)：InnoDB遍历整张表，但不取值，server层对于返回的每一行，放一个“1”进去，判断不为空，按行累加。
+
+- count(字段)
+
+  - 字段定义为`not null`，按行读取该字段，server层判断字段不能为`null`，按行累加；
+  - 字段定义允许为`null`，按行读取该字段，server层判断字段不为`null`时，才按行累加。
+
+- count(*)：InnoDB遍历整张表，不取值，判断✳不可能为`null`，直接按行累加。
+
+- 按效率排序（尽量使用count(*)）：
+
+  ​		count(字段) < count(主键id) < count(1) ≈ count(*)
+
+# 13 日志索引问题串烧
+
+## 13.1 问题一：在两阶段提交的不同瞬间，MySQL如果发生异常重启，是怎么保证数据完整性的？
+
+- 若redo log中的事务是完整的，即有了commit标识，则直接提交；
+- 若redo log中的事务只有完整的prepare，则判断对应的事务binlog是否存在并完整（保证主备一致性）：
+  - 如果是，则提交事务；
+  - 否则，回滚事务。
+
+## 13.2 问题二：MySQL如何判断binlog的完整性？
+
+- 一个事务的binlog是有完整格式的：
+  - statement格式的binlog，最后会有COMMIT;
+  - row格式的binlog，最后会有一个XID event。
+- 5.6.2之后，引入binlog-checksum参数，验证binlog内容的正确性。
+
+## 13.3 问题三：redo log和binlog是怎么关联起来的？
+
+- 两者有一个共同的数据字段——XID。
+- 崩溃恢复时，按顺序扫描redo log：
+  - 若碰到既有prepare，又有commit的redo log，就直接提交；
+  - 若碰到只有prepare，而没有commit的redo log，就拿着XID去binlog找对应的事务。
+
+## 13.4 问题四： 处于prepare阶段的redo log加上完整binlog，重启就能恢复，这样设计的原因？
+
+- 保证主库和备库的数据一致性。
+
+## 13.5 问题五：放弃两阶段提交，先写redo log，再写binlog，崩溃恢复时保证两个日志都完整，这样做不可以的原因？
+
+- 对于InnoDB来说，若redo log提交完成了，事务就不能回滚；
+- 若redo log直接提交，然后binlog写入失败，InnoDB无法回滚，数据和binlog日志不一致。
+
+## 13.6 问题六：只用binlog来支持崩溃恢复和归档，这样做不可以的原因？
+
+- 历史原因
+  - InnoDB不是MySQL的原生存储引擎，而MyISAM在设计之初就没有支持崩溃恢复；
+  - InnoDB在加入MySQL引擎家族之前，就已经是一个提供崩溃恢复和事务支持的引擎了。加入之后，就直接使用InnoDB的redo log来支持崩溃恢复。
+- 实现上的原因
+  - binlog没有能力恢复“数据页”，因为binlog中并没有记录数据页的更新细节。
+
+## 13.7 问题七：只用redo log可不可以？
+
+- 只要有redo log，就是crash-safe的。
+- binlog有着redo log无法替代的功能：
+  - 归档。
+  - MySQL系统依赖于binlog，比如高可用的基础就是binlog复制。
+
+## 13.8 问题八：redo log一般设置多大？
+
+- 对于若干TB的磁盘，一般设为4个文件，每个文件1GB。
+
+## 13.9 问题九：正常数据写入后的最终落盘，是从redo log更新过来的还是从buffer pool更新过来的？
+
+- redo log并没有记录数据页的完整数据，也就没有能力自己去更新磁盘数据页。
+- 正常情况下，数据落盘，也就是刷脏页，即把内存中的数据页写盘。
+- 崩溃恢复情况下，InnoDB如果判断到一个数据页可能在崩溃恢复时丢失更新，就会把它读到内存，然后让redo log更新内存内容。更新完成后，内存页变成脏页，也就回到了上述正常的情况。
+
+## 13.10 问题十：redo log buffer是什么？是先修改内存，还是先写redo log？
+
+- 事务还没有commit时，使用redo log buffer先缓存redo日志内容，待commit之后，将redo log buffer中内容写入redo log。
+
+## 13.11 问题十一：在并发场景下，同时有两个人，设置为关注对方，就可能导致无法成功加为朋友关系。如何处理？
+
+```mysql
+# 场景需求：A、B两个用户，若互相关注，则成为好友。
+#          A关注B时，首先，查询B是否关注A。
+		  select * from like where user_id=B and liker_id=A;
+#          若是，A、B成为好友；
+		  insert into friend;
+#          若不是，则只是“A关注B”的单向关系。
+		  insert into like;
+
+CREATE TABLE `like` (
+	`id` int(11) NOT NULL AUTO_INCREMENT,
+	`user_id` int(11) NOT NULL,
+	`liker_id` int(11) NOT NULL,
+	PRIMARY KEY (`id`),
+	UNIQUE KEY `uk_user_id_liker_id` (`user_id`, `liker_id`)
+) ENGINE=InnoDB;
+
+CREATE TABLE `friend` (
+	`id` int(11) NOT NULL AUTO_INCREMENT,
+	`friend_1_id` int(11) NOT NULL,
+	`friend_2_id` int(11) NOT NULL,
+	PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_friend` (`friend_1_id`, `friend_2_id`)
+) ENGINE=InnoDB;
+
+# SOLUTION
+# 为表like增加一个字段relatio_ship，取值1、2、3
+# 1：user_id关注liker_id；2: liker_id关注user_id；3：互相关注
+
+# A关注B时，若A<B，则执行
+  begin;
+  insert into `like` (user_id, liker_id, relation_ship) values(A, B, 1) on duplicate key update relation_ship=relation_ship | 1;
+  select relation_ship from `like` where user_id=A and liker_id=B;
+# 若relation_ship=1，则事务结束，执行commit
+# 若relation_ship=3，则执行
+  insert ignore into friend(friend_1_id, friend_2_id) values(A, B);
+  commit;
+  
+# 若A>B时，则执行
+  begin;
+  insert into `like` (user_id, liker_id, relation_ship) values(B, A, 2) on duplicate key update relation_ship=relation_ship | 2;
+  select relation_ship from `like` where user_id=B and liker_id=A;
+# 若relation_ship=2，则事务结束，执行commit
+# 若relation_ship=3，则执行
+  insert ignore into friend(friend_1_id, friend_2_id) values(B, A);
+  commit;
+  
+# EXPLAIN
+# 表like强烈保证了“user_id < liker_id”，A、B同时关注对方，会产生锁冲突。“|”以及“ignore”都是为了保证重复调用时的幂等性。
+# 先执行的事务会执行'insert into `like`'，同时下面的select持有该行的读锁；后到的另一个事务由于唯一键冲突被降级为'update `like` set relation_ship=relation_ship | 2 where user_id = A and liker_id = B;'后，只有等待该行的行锁被释放。
+```
+
+# 14 如何学习MySQL？
+
+## 14.1 尝试看源码解决问题
+
+## 14.2 混社区分享经验
+
+## 14.3 了解了原理可以更好的定位问题
+
+- 即使只是知道每个参数的意思~~~
+
+## 14.4 了解了原理可以更巧妙地解决问题
+
+## 14.5 看得懂源码能够获取更多的解决办法
+
+## 14.6 了解每个参数的意思
+
+## 14.7 了解MySQL为什么可以这样使用
+
+## 14.8 了解每个参数的实现原理
+
+## 14.9 看懂源码加深对数据库的理解
+
+## 14.10 首先要会用，然后发现问题，解决问题
+
+## 14.11 先实践，构建知识网络，然后阅读MySQL的官方手册
+
+## 14.12 阅读《高性能MySQL》
+
+## 14.13 培养习惯提高SQL效率
+
+- 多写SQL
+
+## 14.14 动手调试源码
+
+## 14.15 看技术文章时，列提纲，摆问题，写理解
+
+## 14.16 多多享受找出问题和解决问题的那一刻，爽！
+
+# 15 谈谈“order by”
+
+##  15.1 全字段排序
+
