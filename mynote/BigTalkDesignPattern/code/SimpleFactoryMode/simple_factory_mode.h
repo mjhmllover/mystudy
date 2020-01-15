@@ -23,6 +23,9 @@ protected:
 class OperationAdd : public Operation
 {
 public:
+    OperationAdd();
+    ~OperationAdd();
+public:
     double GetResult();
 };
 

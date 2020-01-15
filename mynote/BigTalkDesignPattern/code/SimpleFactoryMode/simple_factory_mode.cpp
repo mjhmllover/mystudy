@@ -3,10 +3,14 @@
 
 Operation::Operation()
 : dNumLeft(0), dNumRight(0)
-{}
+{
+    std::cout << "construct Operation" << std::endl;
+}
 
 Operation::~Operation()
-{}
+{
+    std::cout << "reback Operation" << std::endl;
+}
 
 double Operation::GetResult()
 {
@@ -17,6 +21,16 @@ void Operation::SetNums(double _dNumLeft, double _dNumRight)
 {
     dNumLeft  = _dNumLeft;
     dNumRight = _dNumRight;
+}
+
+OperationAdd::OperationAdd()
+{
+    std::cout << "construct OperationAdd" << std::endl;
+}
+
+OperationAdd::~OperationAdd()
+{
+    std::cout << "reback OperationAdd" << std::endl;
 }
 
 double OperationAdd::GetResult()
