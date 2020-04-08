@@ -151,3 +151,103 @@ DEALLOCATE prepare stmt;
 # 尽量将业务逻辑写在业务代码中，让数据库只做“读写数据”的事情
 
 ## 课后题：采用随机算法2完成随机选择3个单词，扫描总行数为C+(Y1+1)+(Y2+1)+(Y3+1)，如何进一步减少扫描行数？
+select count(*) into @C from test17.words;
++-------+
+| @C    |
++-------+
+| 10000 |
++-------+
+1 row in set (0.00 sec)
+
+set @Y1 = floor(@C * rand());
++------+
+| @Y1  |
++------+
+| 5676 |
++------+
+1 row in set (0.00 sec)
+
+set @Y2 = floor(@C * rand());
++------+
+| @Y2  |
++------+
+| 3517 |
++------+
+1 row in set (0.00 sec)
+
+set @Y3 = floor(@C * rand());
++------+
+| @Y3  |
++------+
+|  557 |
++------+
+1 row in set (0.00 sec)
+
+select LEAST(@Y1, @Y2, @Y3) into @L;
+mysql> select @L;
++------+
+| @L   |
++------+
+|  557 |
++------+
+1 row in set (0.00 sec)
+
+select GREATEST(@Y1, @Y2, @Y3) into @G;
++------+
+| @G   |
++------+
+| 5676 |
++------+
+1 row in set (0.00 sec)
+
+select @Y1 + @Y2 + @Y3 - @L - @G into @M;
++------+
+| @M   |
++------+
+| 3517 |
++------+
+1 row in set (0.00 sec)
+
+set @l_sql = concat("select id into @l_id from test17.words limit ", @L, ",1");
+prepare stmt from @l_sql;
+execute stmt;
+DEALLOCATE prepare stmt;
++-------+
+| @l_id |
++-------+
+|   558 |
++-------+
+1 row in set (0.00 sec)
+
+set @m_sql = concat("select id into @m_id from test17.words where id > @l_id limit ", @M - @L, ",1");
+prepare stmt from @m_sql;
+execute stmt;
+DEALLOCATE prepare stmt;
++-------+
+| @m_id |
++-------+
+|  3519 |
++-------+
+1 row in set (0.00 sec)
+
+set @g_sql = concat("select id into @g_id from test17.words where id > @m_id limit ", @G - @M, ",1");
+prepare stmt from @g_sql;
+execute stmt;
+DEALLOCATE prepare stmt;
++-------+
+| @g_id |
++-------+
+|  5679 |
++-------+
+1 row in set (0.00 sec)
+
+# 随机选择三个单词
+select * from test17.words where id in (@l_id, @m_id, @g_id);
++------+------+
+| id   | word |
++------+------+
+|  558 | affh |
+| 3519 | dfbi |
+| 5679 | fghi |
++------+------+
+3 rows in set (0.00 sec)
